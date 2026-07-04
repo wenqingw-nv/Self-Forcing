@@ -25,7 +25,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
 
         # Step 2: Initialize scheduler
         self.num_train_timesteps = args.num_train_timestep
-        self.sampling_steps = 50
+        self.sampling_steps = getattr(args, "sampling_steps", 50)
         self.sample_solver = 'unipc'
         self.shift = args.timestep_shift
 
@@ -46,13 +46,26 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         if self.num_frame_per_block > 1:
             self.generator.model.num_frame_per_block = self.num_frame_per_block
 
+        # idea #6 velocity-residual corrector r_phi (optional; None == frozen baseline)
+        self.corrector = None
+        self.corrector_gate = None   # optional 1-D tensor [num_train_timesteps] -> alpha(t)
+        self.corrector_alpha = 1.0
+        self.corrector_hist = 8      # committed-latent history window fed to r_phi
+
+    def attach_corrector(self, corrector, gate=None, alpha=1.0):
+        """v_rect = flow_pred + alpha(t) * r_phi(z_t, history, t). alpha=0 / None == baseline."""
+        self.corrector = corrector
+        self.corrector_gate = gate
+        self.corrector_alpha = alpha
+
     def inference(
         self,
         noise: torch.Tensor,
         text_prompts: List[str],
         initial_latent: Optional[torch.Tensor] = None,
         return_latents: bool = False,
-        start_frame_index: Optional[int] = 0
+        start_frame_index: Optional[int] = 0,
+        low_memory: bool = False,  # accepted+ignored (distilled pipeline uses it)
     ) -> torch.Tensor:
         """
         Perform inference on the given noise and text prompts.
@@ -222,14 +235,22 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                 flow_pred = flow_pred_uncond + self.args.guidance_scale * (
                     flow_pred_cond - flow_pred_uncond)
 
+                # idea #6: v_rect = v_theta + alpha(t) * r_phi(z_t, history, t)
+                if self.corrector is not None:
+                    history = output[:, max(0, current_start_frame - self.corrector_hist):current_start_frame]
+                    res = self.corrector(latent_model_input, timestep, history=history if history.shape[1] else None)
+                    a = self.corrector_alpha
+                    if self.corrector_gate is not None:
+                        g = self.corrector_gate.to(res.device)[timestep.long().clamp(0, self.corrector_gate.numel() - 1)]
+                        a = a * g[:, :, None, None, None]  # (B,F,1,1,1)
+                    flow_pred = flow_pred + a * res
+
                 temp_x0 = sample_scheduler.step(
                     flow_pred,
                     t,
                     latents,
                     return_dict=False)[0]
                 latents = temp_x0
-                print(f"kv_cache['local_end_index']: {self.kv_cache_pos[0]['local_end_index']}")
-                print(f"kv_cache['global_end_index']: {self.kv_cache_pos[0]['global_end_index']}")
 
             # Step 3.2: record the model's output
             output[:, cache_start_frame:cache_start_frame + current_num_frames] = latents

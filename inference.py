@@ -4,7 +4,17 @@ import os
 from omegaconf import OmegaConf
 from tqdm import tqdm
 from torchvision import transforms
-from torchvision.io import write_video
+import numpy as np
+import imageio.v2 as _imageio
+
+
+def write_video(path, frames, fps=16):  # torchvision.io.write_video removed in recent torchvision
+    a = frames.detach().cpu().numpy() if hasattr(frames, "detach") else np.asarray(frames)
+    if a.dtype != np.uint8:
+        a = np.clip(a * 255.0 if float(a.max()) <= 1.0 else a, 0, 255).astype(np.uint8)
+    _imageio.mimwrite(path, list(a), fps=fps, codec="libx264")
+
+
 from einops import rearrange
 import torch.distributed as dist
 from torch.utils.data import DataLoader, SequentialSampler

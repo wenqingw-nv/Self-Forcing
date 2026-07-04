@@ -21,7 +21,7 @@ import torch.distributed as dist
 # see https://github.com/pytorch/pytorch/issues/133254
 # change to default for other models
 flex_attention = torch.compile(
-    flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs")
+    flex_attention, dynamic=False)  # default mode: conservative blocks fit sm_103 SRAM (max-autotune backward OOMs on shared mem)
 
 
 def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):

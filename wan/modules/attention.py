@@ -67,6 +67,24 @@ def flash_attention(
     def half(x):
         return x if x.dtype in half_dtypes else x.to(dtype)
 
+    if not (FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE):
+        # SDPA fallback (flash_attn not installed). q:[B,Lq,Nq,C] k,v:[B,Lk,Nk,C]
+        import torch.nn.functional as F
+        qh, kh, vh = half(q).transpose(1, 2), half(k).transpose(1, 2), half(v).transpose(1, 2)  # [B,N,L,C]
+        if kh.size(1) != qh.size(1):  # grouped-query: expand kv heads
+            rep = qh.size(1) // kh.size(1)
+            kh, vh = kh.repeat_interleave(rep, 1), vh.repeat_interleave(rep, 1)
+        if q_scale is not None:
+            qh = qh * q_scale
+        attn_mask = None
+        if k_lens is not None:
+            idx = torch.arange(k.size(1), device=k.device)[None, :]
+            attn_mask = (idx < k_lens.to(k.device)[:, None])[:, None, None, :]  # [B,1,1,Lk]
+        x = F.scaled_dot_product_attention(
+            qh, kh, vh, attn_mask=attn_mask, dropout_p=dropout_p if dropout_p else 0.0,
+            is_causal=causal and attn_mask is None, scale=softmax_scale)
+        return x.transpose(1, 2).type(out_dtype)  # [B,Lq,Nq,C]
+
     # preprocess query
     if q_lens is None:
         q = half(q.flatten(0, 1))
