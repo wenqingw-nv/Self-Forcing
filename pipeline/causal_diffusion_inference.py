@@ -213,6 +213,12 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     [batch_size, current_num_frames], device=noise.device, dtype=torch.float32
                 )
 
+                # idea #1 Drift-SNR gate for the LoRA corrector: per-timestep alpha via lora scale
+                if getattr(self, "lora_gate", None) is not None:
+                    from wan.modules.lora import set_lora_scale
+                    ti = torch.argmin((self.lora_gate["timesteps"].to(t.device) - t).abs()).item()
+                    set_lora_scale(self.generator.model, float(self.lora_gate["alpha"][ti]))
+
                 flow_pred_cond, _ = self.generator(
                     noisy_image_or_video=latent_model_input,
                     conditional_dict=conditional_dict,
@@ -256,19 +262,25 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
             output[:, cache_start_frame:cache_start_frame + current_num_frames] = latents
 
             # Step 3.3: rerun with timestep zero to update KV cache using clean context
+            # (DF noisy-context baseline, BAgger sigma_test: cache noised context at matching t)
+            ctx_latents, ctx_timestep = latents, timestep * 0
+            if getattr(self, "context_noise_sigma", 0):
+                s = self.context_noise_sigma
+                ctx_latents = (1 - s) * latents + s * torch.randn_like(latents)
+                ctx_timestep = torch.ones_like(timestep) * (s * self.num_train_timesteps)
             self.generator(
-                noisy_image_or_video=latents,
+                noisy_image_or_video=ctx_latents,
                 conditional_dict=conditional_dict,
-                timestep=timestep * 0,
+                timestep=ctx_timestep,
                 kv_cache=self.kv_cache_pos,
                 crossattn_cache=self.crossattn_cache_pos,
                 current_start=current_start_frame * self.frame_seq_length,
                 cache_start=cache_start_frame * self.frame_seq_length
             )
             self.generator(
-                noisy_image_or_video=latents,
+                noisy_image_or_video=ctx_latents,
                 conditional_dict=unconditional_dict,
-                timestep=timestep * 0,
+                timestep=ctx_timestep,
                 kv_cache=self.kv_cache_neg,
                 crossattn_cache=self.crossattn_cache_neg,
                 current_start=current_start_frame * self.frame_seq_length,
