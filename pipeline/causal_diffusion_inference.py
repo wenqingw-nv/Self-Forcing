@@ -52,11 +52,33 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         self.corrector_alpha = 1.0
         self.corrector_hist = 8      # committed-latent history window fed to r_phi
 
+        # fractional History Guidance baseline (DFoT 2502.06764; BAgger w=1.2):
+        # v = v(z|h_noised) + w*(v(z|h_clean) - v(z|h_noised)); weak branch caches context at hg_sigma
+        self.hg_scale = 0.0          # 0 == off; BAgger uses 1.2
+        self.hg_sigma = 0.5          # fractional history-corruption level (our choice; BAgger unspecified)
+        self.kv_cache_hg_pos = None
+        self.kv_cache_hg_neg = None
+
     def attach_corrector(self, corrector, gate=None, alpha=1.0):
         """v_rect = flow_pred + alpha(t) * r_phi(z_t, history, t). alpha=0 / None == baseline."""
         self.corrector = corrector
         self.corrector_gate = gate
         self.corrector_alpha = alpha
+
+    def _cache_hg_context(self, latents, conditional_dict, unconditional_dict,
+                          current_start_frame, cache_start_frame):
+        """Cache hg_sigma-noised context into the weak-history caches (fractional HG branch)."""
+        s = self.hg_sigma
+        noised = (1 - s) * latents + s * torch.randn_like(latents)
+        t = torch.full((latents.shape[0], latents.shape[1]), s * self.num_train_timesteps,
+                       device=latents.device, dtype=torch.float32)
+        for cond, cache, xcache in ((conditional_dict, self.kv_cache_hg_pos, self.crossattn_cache_pos),
+                                    (unconditional_dict, self.kv_cache_hg_neg, self.crossattn_cache_neg)):
+            self.generator(
+                noisy_image_or_video=noised, conditional_dict=cond, timestep=t,
+                kv_cache=cache, crossattn_cache=xcache,
+                current_start=current_start_frame * self.frame_seq_length,
+                cache_start=cache_start_frame * self.frame_seq_length)
 
     def inference(
         self,
@@ -126,15 +148,13 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                 self.crossattn_cache_pos[block_index]["is_init"] = False
                 self.crossattn_cache_neg[block_index]["is_init"] = False
             # reset kv cache
+            hg_caches = [c for c in (self.kv_cache_hg_pos, self.kv_cache_hg_neg) if c is not None]
             for block_index in range(len(self.kv_cache_pos)):
-                self.kv_cache_pos[block_index]["global_end_index"] = torch.tensor(
-                    [0], dtype=torch.long, device=noise.device)
-                self.kv_cache_pos[block_index]["local_end_index"] = torch.tensor(
-                    [0], dtype=torch.long, device=noise.device)
-                self.kv_cache_neg[block_index]["global_end_index"] = torch.tensor(
-                    [0], dtype=torch.long, device=noise.device)
-                self.kv_cache_neg[block_index]["local_end_index"] = torch.tensor(
-                    [0], dtype=torch.long, device=noise.device)
+                for cache in [self.kv_cache_pos, self.kv_cache_neg] + hg_caches:
+                    cache[block_index]["global_end_index"] = torch.tensor(
+                        [0], dtype=torch.long, device=noise.device)
+                    cache[block_index]["local_end_index"] = torch.tensor(
+                        [0], dtype=torch.long, device=noise.device)
 
         # Step 2: Cache context feature
         current_start_frame = start_frame_index
@@ -193,6 +213,9 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     current_start=current_start_frame * self.frame_seq_length,
                     cache_start=cache_start_frame * self.frame_seq_length
                 )
+                if self.hg_scale:
+                    self._cache_hg_context(current_ref_latents, conditional_dict, unconditional_dict,
+                                           current_start_frame, cache_start_frame)
                 current_start_frame += self.num_frame_per_block
                 cache_start_frame += self.num_frame_per_block
 
@@ -241,6 +264,23 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                 flow_pred = flow_pred_uncond + self.args.guidance_scale * (
                     flow_pred_cond - flow_pred_uncond)
 
+                # fractional History Guidance: extrapolate clean-history vs noised-history branches
+                if self.hg_scale:
+                    hg_cond, _ = self.generator(
+                        noisy_image_or_video=latent_model_input, conditional_dict=conditional_dict,
+                        timestep=timestep, kv_cache=self.kv_cache_hg_pos,
+                        crossattn_cache=self.crossattn_cache_pos,
+                        current_start=current_start_frame * self.frame_seq_length,
+                        cache_start=cache_start_frame * self.frame_seq_length)
+                    hg_uncond, _ = self.generator(
+                        noisy_image_or_video=latent_model_input, conditional_dict=unconditional_dict,
+                        timestep=timestep, kv_cache=self.kv_cache_hg_neg,
+                        crossattn_cache=self.crossattn_cache_neg,
+                        current_start=current_start_frame * self.frame_seq_length,
+                        cache_start=cache_start_frame * self.frame_seq_length)
+                    flow_weak = hg_uncond + self.args.guidance_scale * (hg_cond - hg_uncond)
+                    flow_pred = flow_weak + self.hg_scale * (flow_pred - flow_weak)
+
                 # idea #6: v_rect = v_theta + alpha(t) * r_phi(z_t, history, t)
                 if self.corrector is not None:
                     history = output[:, max(0, current_start_frame - self.corrector_hist):current_start_frame]
@@ -287,6 +327,10 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                 cache_start=cache_start_frame * self.frame_seq_length
             )
 
+            if self.hg_scale:
+                self._cache_hg_context(latents, conditional_dict, unconditional_dict,
+                                       current_start_frame, cache_start_frame)
+
             # Step 3.4: update the start and end frame indices
             current_start_frame += current_num_frames
             cache_start_frame += current_num_frames
@@ -329,6 +373,16 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
 
         self.kv_cache_pos = kv_cache_pos  # always store the clean cache
         self.kv_cache_neg = kv_cache_neg  # always store the clean cache
+
+        if getattr(self, "hg_scale", 0):  # weak-history branch caches for fractional HG
+            def _mk():
+                return [{"k": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
+                         "v": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
+                         "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
+                         "local_end_index": torch.tensor([0], dtype=torch.long, device=device)}
+                        for _ in range(self.num_transformer_blocks)]
+            self.kv_cache_hg_pos = _mk()
+            self.kv_cache_hg_neg = _mk()
 
     def _initialize_crossattn_cache(self, batch_size, dtype, device):
         """
