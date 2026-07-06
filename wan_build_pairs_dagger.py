@@ -19,8 +19,8 @@ NCTX = 3
 NCLIPS = 40
 NPIX = (K - 1) * 4 + 1
 OUTDIR = "wan_cache"
-OUT = os.path.join(OUTDIR, "pairs_k48_dagger1.pt")
-CKPT = "lora_r_phi_k48.pt"
+OUT = os.path.join(OUTDIR, os.environ.get("OUT_NAME", "pairs_k48_dagger1.pt"))
+CKPT = os.environ.get("CKPT", "lora_r_phi_k48.pt")
 
 
 def main():
@@ -30,6 +30,11 @@ def main():
     torch.set_grad_enabled(False)
     pipe = CausalDiffusionInferencePipeline(cfg, device=torch.device(DEVICE)).to(dtype=torch.bfloat16).cuda()
     pipe.corrector = None
+    _ab = os.environ.get("ADAPTED_BASE")
+    if _ab:
+        _sd = torch.load(_ab, map_location="cpu")["merged"]
+        pipe.generator.model.load_state_dict({k: v.to(torch.bfloat16) for k, v in _sd.items()}, strict=False)
+        print(f"adapted base loaded: {_ab}", flush=True)
     model = pipe.generator.model
     apply_lora(model, rank=16)
     sd = torch.load(os.path.join(OUTDIR, CKPT), map_location="cpu")["lora"]

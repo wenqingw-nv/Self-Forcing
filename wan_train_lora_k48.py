@@ -23,8 +23,8 @@ LR = 5e-4
 WARMUP = 60
 EVAL_EVERY = 100
 OUT = "wan_cache"
-PAIRS = "pairs_k48.pt"
-CKPT = "lora_r_phi_k48.pt"
+PAIRS = os.environ.get("PAIRS", "pairs_k48.pt")
+CKPT = os.environ.get("CKPT", "lora_r_phi_k48.pt")
 
 
 def velocity_tf(pipe, cond, history, x0_cur, z_t, t):  # grad-capable teacher-forcing velocity
@@ -42,6 +42,11 @@ def main():
     torch.set_grad_enabled(True)
     pipe = CausalDiffusionInferencePipeline(cfg, device=torch.device(DEVICE)).to(dtype=torch.bfloat16).cuda()
     pipe.corrector = None
+    _ab = os.environ.get("ADAPTED_BASE")
+    if _ab:
+        _sd = torch.load(_ab, map_location="cpu")["merged"]
+        pipe.generator.model.load_state_dict({k: v.to(torch.bfloat16) for k, v in _sd.items()}, strict=False)
+        print(f"adapted base loaded: {_ab}", flush=True)
     model = pipe.generator.model
     apply_lora(model, rank=16)
     model.gradient_checkpointing = True   # recompute block activations in backward (else OOM on 18.7k-token seq)

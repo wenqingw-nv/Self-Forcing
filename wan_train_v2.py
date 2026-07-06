@@ -27,8 +27,8 @@ WARMUP = 40
 CW_LOSS = 0.5                                        # contraction-term weight
 EVAL_EVERY = 100
 OUT = "wan_cache"
-POOLS = ["pairs_k48.pt", "pairs_k48_dagger1.pt"]     # DAgger aggregation (round-0 + round-1)
-INIT = "lora_r_phi_k48.pt"
+POOLS = os.environ.get("POOLS", "pairs_k48.pt,pairs_k48_dagger1.pt").split(",")     # DAgger aggregation (round-0 + round-1)
+INIT = os.environ.get("INIT", "lora_r_phi_k48.pt")
 CKPT = f"lora_r_phi_v2_{LOSS_MODE}.pt"
 
 
@@ -47,6 +47,11 @@ def main():
     torch.set_grad_enabled(True)
     pipe = CausalDiffusionInferencePipeline(cfg, device=torch.device(DEVICE)).to(dtype=torch.bfloat16).cuda()
     pipe.corrector = None
+    _ab = os.environ.get("ADAPTED_BASE")
+    if _ab:
+        _sd = torch.load(_ab, map_location="cpu")["merged"]
+        pipe.generator.model.load_state_dict({k: v.to(torch.bfloat16) for k, v in _sd.items()}, strict=False)
+        print(f"adapted base loaded: {_ab}", flush=True)
     model = pipe.generator.model
     apply_lora(model, rank=16)
     sd = torch.load(os.path.join(OUT, INIT), map_location="cpu")["lora"]
