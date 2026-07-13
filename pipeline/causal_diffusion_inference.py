@@ -55,9 +55,19 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         # fractional History Guidance baseline (DFoT 2502.06764; BAgger w=1.2):
         # v = v(z|h_noised) + w*(v(z|h_clean) - v(z|h_noised)); weak branch caches context at hg_sigma
         self.hg_scale = 0.0          # 0 == off; BAgger uses 1.2
-        self.hg_sigma = 0.5          # fractional history-corruption level (our choice; BAgger unspecified)
+        self.hg_sigma = 0.5          # fractional history-corruption level (our-variant mode)
+        self.hg_exact = False        # BAgger's exact eq.: v(uncond) + w_t[v(c)-v(uncond)] + w_hg[v(h_p800,uncond)-v(noise-ctx,uncond)]
         self.kv_cache_hg_pos = None
         self.kv_cache_hg_neg = None
+
+        # Pathwise Test-Time Correction baseline (arXiv 2602.05871, their chosen config = steps {500, 250}):
+        # at transitions into these noise levels, renoise x0_hat, denoise once under the earliest-chunk
+        # reference context S0, renoise again, resume. Multi-step-host port: the reference chunk is
+        # re-encoded at the adjacent rope position (their hosts re-anchor via the rolling cache).
+        self.ttc_steps = None        # e.g. [500, 250]; None == off
+        self.kv_cache_ttc_pos = None
+        self.kv_cache_ttc_neg = None
+        self._ttc_ref_latents = None
 
     def attach_corrector(self, corrector, gate=None, alpha=1.0):
         """v_rect = flow_pred + alpha(t) * r_phi(z_t, history, t). alpha=0 / None == baseline."""
@@ -67,18 +77,43 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
 
     def _cache_hg_context(self, latents, conditional_dict, unconditional_dict,
                           current_start_frame, cache_start_frame):
-        """Cache hg_sigma-noised context into the weak-history caches (fractional HG branch)."""
-        s = self.hg_sigma
-        noised = (1 - s) * latents + s * torch.randn_like(latents)
-        t = torch.full((latents.shape[0], latents.shape[1]), s * self.num_train_timesteps,
-                       device=latents.device, dtype=torch.float32)
-        for cond, cache, xcache in ((conditional_dict, self.kv_cache_hg_pos, self.crossattn_cache_pos),
-                                    (unconditional_dict, self.kv_cache_hg_neg, self.crossattn_cache_neg)):
+        """Cache weak-history branches. Our-variant: hg_sigma-noised ctx, cond+uncond.
+        Exact (BAgger eq.): hg_pos <- ctx noised @ p=800 (uncond text); hg_neg <- pure-noise ctx (uncond)."""
+        if self.hg_exact:
+            branches = (
+                (0.8, unconditional_dict, self.kv_cache_hg_pos, self.crossattn_cache_neg),
+                (1.0, unconditional_dict, self.kv_cache_hg_neg, self.crossattn_cache_neg))
+        else:
+            branches = (
+                (self.hg_sigma, conditional_dict, self.kv_cache_hg_pos, self.crossattn_cache_pos),
+                (self.hg_sigma, unconditional_dict, self.kv_cache_hg_neg, self.crossattn_cache_neg))
+        for s, cond, cache, xcache in branches:
+            noised = (1 - s) * latents + s * torch.randn_like(latents)
+            t = torch.full((latents.shape[0], latents.shape[1]), min(s * self.num_train_timesteps, 999),
+                           device=latents.device, dtype=torch.float32)
             self.generator(
                 noisy_image_or_video=noised, conditional_dict=cond, timestep=t,
                 kv_cache=cache, crossattn_cache=xcache,
                 current_start=current_start_frame * self.frame_seq_length,
                 cache_start=cache_start_frame * self.frame_seq_length)
+
+    def _ttc_encode_ref(self, conditional_dict, unconditional_dict, current_start_frame):
+        """Rebuild the S0 reference caches: only the earliest generated chunk, re-encoded at the
+        rope position directly preceding the current chunk (stays inside the trained local window)."""
+        nfb = self.num_frame_per_block
+        zeros_t = torch.zeros([self._ttc_ref_latents.shape[0], nfb],
+                              device=self._ttc_ref_latents.device, dtype=torch.float32)
+        branches = ((conditional_dict, self.kv_cache_ttc_pos, self.crossattn_cache_pos),
+                    (unconditional_dict, self.kv_cache_ttc_neg, self.crossattn_cache_neg))
+        for cond, cache, xcache in branches:
+            for block in cache:
+                block["global_end_index"].zero_()
+                block["local_end_index"].zero_()
+            self.generator(
+                noisy_image_or_video=self._ttc_ref_latents, conditional_dict=cond, timestep=zeros_t,
+                kv_cache=cache, crossattn_cache=xcache,
+                current_start=(current_start_frame - nfb) * self.frame_seq_length,
+                cache_start=0)
 
     def inference(
         self,
@@ -129,6 +164,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
             device=noise.device,
             dtype=noise.dtype
         )
+        self._ttc_ref_latents = None  # per-video reference; captured from the first generated chunk
 
         # Step 1: Initialize KV cache to all zeros
         if self.kv_cache_pos is None:
@@ -148,7 +184,8 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                 self.crossattn_cache_pos[block_index]["is_init"] = False
                 self.crossattn_cache_neg[block_index]["is_init"] = False
             # reset kv cache
-            hg_caches = [c for c in (self.kv_cache_hg_pos, self.kv_cache_hg_neg) if c is not None]
+            hg_caches = [c for c in (self.kv_cache_hg_pos, self.kv_cache_hg_neg,
+                                     self.kv_cache_ttc_pos, self.kv_cache_ttc_neg) if c is not None]
             for block_index in range(len(self.kv_cache_pos)):
                 for cache in [self.kv_cache_pos, self.kv_cache_neg] + hg_caches:
                     cache[block_index]["global_end_index"] = torch.tensor(
@@ -230,7 +267,15 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
 
             # Step 3.1: Spatial denoising loop
             sample_scheduler = self._initialize_sample_scheduler(noise)
-            for _, t in enumerate(tqdm(sample_scheduler.timesteps)):
+            # Pathwise TTC: mark the loop iterations whose NEXT timestep is a correction level
+            ttc_iters = set()
+            if self.ttc_steps and self._ttc_ref_latents is not None:
+                ts = sample_scheduler.timesteps
+                for target in self.ttc_steps:
+                    inext = int(torch.argmin((ts.float() - target).abs()).item())
+                    if inext >= 1:
+                        ttc_iters.add(inext - 1)
+            for step_i, t in enumerate(tqdm(sample_scheduler.timesteps)):
                 latent_model_input = latents
                 timestep = t * torch.ones(
                     [batch_size, current_num_frames], device=noise.device, dtype=torch.float32
@@ -267,7 +312,8 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                 # fractional History Guidance: extrapolate clean-history vs noised-history branches
                 if self.hg_scale:
                     hg_cond, _ = self.generator(
-                        noisy_image_or_video=latent_model_input, conditional_dict=conditional_dict,
+                        noisy_image_or_video=latent_model_input,
+                        conditional_dict=unconditional_dict if self.hg_exact else conditional_dict,
                         timestep=timestep, kv_cache=self.kv_cache_hg_pos,
                         crossattn_cache=self.crossattn_cache_pos,
                         current_start=current_start_frame * self.frame_seq_length,
@@ -278,8 +324,12 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                         crossattn_cache=self.crossattn_cache_neg,
                         current_start=current_start_frame * self.frame_seq_length,
                         cache_start=cache_start_frame * self.frame_seq_length)
-                    flow_weak = hg_uncond + self.args.guidance_scale * (hg_cond - hg_uncond)
-                    flow_pred = flow_weak + self.hg_scale * (flow_pred - flow_weak)
+                    if self.hg_exact:
+                        # hg_cond ran on hg_pos (h_p800, uncond ctx-branch), hg_uncond on hg_neg (noise ctx)
+                        flow_pred = flow_pred + self.hg_scale * (hg_cond - hg_uncond)
+                    else:
+                        flow_weak = hg_uncond + self.args.guidance_scale * (hg_cond - hg_uncond)
+                        flow_pred = flow_weak + self.hg_scale * (flow_pred - flow_weak)
 
                 # idea #6: v_rect = v_theta + alpha(t) * r_phi(z_t, history, t)
                 if self.corrector is not None:
@@ -291,6 +341,35 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                         a = a * g[:, :, None, None, None]  # (B,F,1,1,1)
                     flow_pred = flow_pred + a * res
 
+                if step_i in ttc_iters:
+                    # Pathwise TTC sandwich (Alg. 1 of arXiv 2602.05871), replacing this solver step:
+                    # x0_hat -> Psi to next level -> denoise under S0 -> x0_c -> Psi again -> resume S_t
+                    sig = sample_scheduler.sigmas[step_i].to(latents)
+                    sig_c = sample_scheduler.sigmas[step_i + 1].to(latents)
+                    x0_hat = latents - sig * flow_pred
+                    t_c = sample_scheduler.timesteps[step_i + 1] * torch.ones_like(timestep)
+                    z_c = (1 - sig_c) * x0_hat + sig_c * torch.randn_like(x0_hat)
+                    self._ttc_encode_ref(conditional_dict, unconditional_dict, current_start_frame)
+                    v_cond, _ = self.generator(
+                        noisy_image_or_video=z_c, conditional_dict=conditional_dict, timestep=t_c,
+                        kv_cache=self.kv_cache_ttc_pos, crossattn_cache=self.crossattn_cache_pos,
+                        current_start=current_start_frame * self.frame_seq_length,
+                        cache_start=cache_start_frame * self.frame_seq_length)
+                    v_unc, _ = self.generator(
+                        noisy_image_or_video=z_c, conditional_dict=unconditional_dict, timestep=t_c,
+                        kv_cache=self.kv_cache_ttc_neg, crossattn_cache=self.crossattn_cache_neg,
+                        current_start=current_start_frame * self.frame_seq_length,
+                        cache_start=cache_start_frame * self.frame_seq_length)
+                    v_c = v_unc + self.args.guidance_scale * (v_cond - v_unc)
+                    x0_c = z_c - sig_c * v_c
+                    latents = (1 - sig_c) * x0_c + sig_c * torch.randn_like(x0_c)
+                    # advance the solver past this step and clear its multistep history
+                    # (the injected state breaks the lower-order continuity assumption)
+                    sample_scheduler._step_index = step_i + 1
+                    sample_scheduler.model_outputs = [None] * len(sample_scheduler.model_outputs)
+                    sample_scheduler.lower_order_nums = 0
+                    continue
+
                 temp_x0 = sample_scheduler.step(
                     flow_pred,
                     t,
@@ -300,6 +379,8 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
 
             # Step 3.2: record the model's output
             output[:, cache_start_frame:cache_start_frame + current_num_frames] = latents
+            if self.ttc_steps is not None and self._ttc_ref_latents is None:
+                self._ttc_ref_latents = latents.detach().clone()  # earliest chunk = S0 reference
 
             # Step 3.3: rerun with timestep zero to update KV cache using clean context
             # (DF noisy-context baseline, BAgger sigma_test: cache noised context at matching t)
@@ -374,15 +455,19 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         self.kv_cache_pos = kv_cache_pos  # always store the clean cache
         self.kv_cache_neg = kv_cache_neg  # always store the clean cache
 
-        if getattr(self, "hg_scale", 0):  # weak-history branch caches for fractional HG
+        if getattr(self, "hg_scale", 0) or getattr(self, "ttc_steps", None):
             def _mk():
                 return [{"k": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
                          "v": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
                          "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
                          "local_end_index": torch.tensor([0], dtype=torch.long, device=device)}
                         for _ in range(self.num_transformer_blocks)]
-            self.kv_cache_hg_pos = _mk()
-            self.kv_cache_hg_neg = _mk()
+            if getattr(self, "hg_scale", 0):
+                self.kv_cache_hg_pos = _mk()
+                self.kv_cache_hg_neg = _mk()
+            if getattr(self, "ttc_steps", None):
+                self.kv_cache_ttc_pos = _mk()
+                self.kv_cache_ttc_neg = _mk()
 
     def _initialize_crossattn_cache(self, batch_size, dtype, device):
         """
