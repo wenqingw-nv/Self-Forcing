@@ -368,6 +368,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     sample_scheduler._step_index = step_i + 1
                     sample_scheduler.model_outputs = [None] * len(sample_scheduler.model_outputs)
                     sample_scheduler.lower_order_nums = 0
+                    sample_scheduler.last_sample = None  # also disarm the UniC corrector update
                     continue
 
                 temp_x0 = sample_scheduler.step(
