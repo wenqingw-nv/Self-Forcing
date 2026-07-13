@@ -17,6 +17,8 @@ KLAT = 201
 BATCH = 4
 D = "wan_cache/finals128"
 ADAPTED = "wan_cache/adapted_base_4000.pt"
+TTC_STEPS = [int(s) for s in os.environ.get("TTC_STEPS", "500,250").split(",")]
+TAG = os.environ.get("TAG", "attc")
 
 
 @torch.no_grad()
@@ -31,12 +33,12 @@ def main():
     pipe.corrector = None
     sd = torch.load(ADAPTED, map_location="cpu")["merged"]
     pipe.generator.model.load_state_dict({k: v.to(torch.bfloat16) for k, v in sd.items()}, strict=False)
-    pipe.ttc_steps = [500, 250]
-    print("adapted base + pathwise TTC @ {500, 250}", flush=True)
+    pipe.ttc_steps = TTC_STEPS
+    print(f"adapted base + pathwise TTC @ {TTC_STEPS} tag={TAG}", flush=True)
 
     for b0 in range(0, 128, BATCH):
         idxs = [i for i in range(b0, min(b0 + BATCH, 128))
-                if not os.path.exists(f"{D}/attc_p{i:03d}.mp4")]
+                if not os.path.exists(f"{D}/{TAG}_p{i:03d}.mp4")]
         if not idxs:
             continue
         pad = [idxs[-1]] * (BATCH - len(idxs))  # kv caches are allocated at BATCH; pad partial batches
@@ -48,11 +50,11 @@ def main():
         video = pipe.inference(noise=noise, text_prompts=[prompts[i] for i in idxs + pad])
         for bi, i in enumerate(idxs):
             fr = (video[bi].permute(0, 2, 3, 1).float() * 255).byte().cpu().numpy()
-            tmp = f"{D}/attc_p{i:03d}.mp4.tmp.mp4"
+            tmp = f"{D}/{TAG}_p{i:03d}.mp4.tmp.mp4"
             imageio.mimsave(tmp, fr, fps=16, quality=8)
-            os.rename(tmp, f"{D}/attc_p{i:03d}.mp4")
+            os.rename(tmp, f"{D}/{TAG}_p{i:03d}.mp4")
         print(f"DONE batch {b0 // BATCH + 1}/32 (prompts {idxs})", flush=True)
-    print("attc finals complete", flush=True)
+    print(f"{TAG} finals complete", flush=True)
 
 
 if __name__ == "__main__":

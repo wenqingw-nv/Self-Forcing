@@ -107,7 +107,10 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     (unconditional_dict, self.kv_cache_ttc_neg, self.crossattn_cache_neg))
         for cond, cache, xcache in branches:
             for block in cache:
-                block["global_end_index"].zero_()
+                # anchor the empty cache at the ref's write position: the cache write computes
+                # local indices as local_end + (current_end - global_end), so a zeroed global_end
+                # with a far-ahead current_start would index past the cache
+                block["global_end_index"].fill_((current_start_frame - nfb) * self.frame_seq_length)
                 block["local_end_index"].zero_()
             self.generator(
                 noisy_image_or_video=self._ttc_ref_latents, conditional_dict=cond, timestep=zeros_t,
