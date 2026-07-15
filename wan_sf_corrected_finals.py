@@ -26,6 +26,10 @@ LORA = os.environ.get("LORA", "wan_cache/lora_r_phi_sf.pt")
 def main():
     cfg = OmegaConf.merge(OmegaConf.load("configs/default_config.yaml"),
                           OmegaConf.load("configs/self_forcing_dmd.yaml"))
+    # rolling 21-frame KV window (as in the sfd baseline row): dmd config leaves local_attn_size
+    # unset -> full attention with a 21-frame cache, which overflows past 21 latents
+    cfg.model_kwargs = OmegaConf.create({"timestep_shift": cfg.timestep_shift,
+                                         "local_attn_size": 21, "sink_size": 0})
     torch.set_grad_enabled(False)
     prompts = [ln.strip() for ln in open(f"{D}/prompts_used.txt") if ln.strip()]
     assert len(prompts) == 128
