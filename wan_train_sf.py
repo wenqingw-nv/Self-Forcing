@@ -26,7 +26,8 @@ LR = 5e-4
 WARMUP = 60
 EVAL_EVERY = 100
 OUT = "wan_cache"
-PAIRS = os.environ.get("PAIRS", "pairs_sf.pt")
+PAIRS = os.environ.get("PAIRS", "pairs_sf.pt").split(",")
+INIT = os.environ.get("INIT")  # optional LoRA ckpt to continue from
 CKPT = os.environ.get("CKPT", "lora_r_phi_sf.pt")
 SF_CKPT = "checkpoints/self_forcing_dmd.pt"
 
@@ -51,12 +52,20 @@ def main():
     pipe = pipe.to(dtype=torch.bfloat16).cuda()
     model = pipe.generator.model
     apply_lora(model, rank=16)
+    if INIT:
+        _lw = torch.load(INIT, map_location="cpu")["lora"]
+        _lw = list(_lw.values()) if isinstance(_lw, dict) else _lw
+        for p, w in zip(lora_parameters(model), _lw):
+            p.data.copy_(w.to(p.device, p.dtype))
+        print(f"continue-training from {INIT}", flush=True)
     model.gradient_checkpointing = True
     print(f"LoRA params {num_lora_params(model)/1e6:.2f}M | 2nd host = SF-distilled", flush=True)
     opt = torch.optim.AdamW(lora_parameters(model), lr=LR)
 
-    d = torch.load(os.path.join(OUT, PAIRS), map_location="cpu")
-    gt, gen, caps = d["gt"], d["gen"], d["captions"]
+    pools = [torch.load(os.path.join(OUT, p), map_location="cpu") for p in PAIRS]
+    gt = torch.cat([d["gt"] for d in pools])
+    gen = torch.cat([d["gen"] for d in pools])
+    caps = sum([list(d["captions"]) for d in pools], [])
     N = gt.shape[0]
     nval = max(4, N // 8)
     train_ids, val_ids = list(range(N - nval)), list(range(N - nval, N))

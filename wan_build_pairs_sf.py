@@ -15,7 +15,8 @@ from pipeline.causal_inference import CausalInferencePipeline
 
 DEVICE = "cuda"
 K, NCTX = 21, 3
-OUT = "wan_cache/pairs_sf.pt"
+OUT = os.environ.get("OUT", "wan_cache/pairs_sf.pt")
+CORRECTOR = os.environ.get("CORRECTOR")  # LoRA ckpt -> DAgger-round rollouts
 SF_CKPT = "checkpoints/self_forcing_dmd.pt"
 
 
@@ -28,6 +29,15 @@ def main():
     sd = torch.load(SF_CKPT, map_location="cpu")
     pipe.generator.load_state_dict(sd.get("generator", sd.get("generator_ema")))
     pipe = pipe.to(dtype=torch.bfloat16).cuda()
+    if CORRECTOR:
+        from wan.modules.lora import apply_lora, set_lora_scale, lora_parameters
+        apply_lora(pipe.generator.model, rank=16)
+        lw = torch.load(CORRECTOR, map_location="cpu")["lora"]
+        lw = list(lw.values()) if isinstance(lw, dict) else lw
+        for p, w in zip(lora_parameters(pipe.generator.model), lw):
+            p.data.copy_(w.to(p.device, p.dtype))
+        set_lora_scale(pipe.generator.model, 1.0)
+        print(f"DAgger round: rollouts with corrector {CORRECTOR}", flush=True)
 
     d = torch.load("wan_cache/synth_clips.pt", map_location="cpu")
     gt_all, caps = d["gt"], d["captions"]
