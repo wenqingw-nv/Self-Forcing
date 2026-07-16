@@ -20,16 +20,16 @@ from wan.modules.lora import apply_lora, set_lora_scale, lora_parameters
 
 DEVICE = "cuda"
 LOSS_MODE = os.environ.get("LOSS_MODE", "both")     # dagger | both
-K, W = 48, 9
+K, W = int(os.environ.get("K", 48)), 9
 STEPS = int(os.environ.get("STEPS", 600))
 LR = 2e-4                                            # continue-training LR (< v1's 5e-4)
 WARMUP = 40
-CW_LOSS = 0.5                                        # contraction-term weight
+CW_LOSS = float(os.environ.get("CW_LOSS", 0.5))     # contraction-term weight
 EVAL_EVERY = 100
 OUT = "wan_cache"
 POOLS = os.environ.get("POOLS", "pairs_k48.pt,pairs_k48_dagger1.pt").split(",")     # DAgger aggregation (round-0 + round-1)
 INIT = os.environ.get("INIT", "lora_r_phi_k48.pt")
-CKPT = f"lora_r_phi_v2_{LOSS_MODE}.pt"
+CKPT = os.environ.get("CKPT", f"lora_r_phi_v2_{LOSS_MODE}.pt")
 
 
 def velocity_tf(pipe, cond, history, x0_cur, z_t, t):
