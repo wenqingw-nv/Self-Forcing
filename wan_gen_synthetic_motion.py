@@ -16,13 +16,17 @@ NCLIPS = int(os.environ.get("NCLIPS", 300))
 STEPS = int(os.environ.get("STEPS", 30))
 OUT = "wan_cache/synth_clips_motion.pt"
 
+# Motion-DIVERSE, not motion-biased: the corrector must inherit no systematic camera prior —
+# camera behavior belongs to the prompt. ~40% keep natural phrasing ("" entries), the rest
+# spread over camera types including explicit static.
 MOTION_CLAUSES = [
+    "", "", "", "",                                                        # natural (no clause)
     " The camera steadily tracks forward through the scene.",
     " A smooth dolly shot, the camera moving continuously ahead.",
     " The camera pans slowly across the scene, revealing new details.",
     " A tracking shot following the subject as it moves through the environment.",
-    " The camera glides forward, the perspective continuously advancing.",
-    " A slow aerial push-in, the viewpoint traveling across the scene.",
+    " A slow orbiting arc shot circling the subject.",
+    " A static tripod shot with a perfectly still camera.",
 ]
 
 
