@@ -12,7 +12,10 @@ from pipeline.causal_diffusion_inference import CausalDiffusionInferencePipeline
 
 DEVICE = "cuda"
 K, NCTX = 21, 3
-OUT = "wan_cache/pairs_synth.pt"
+OUT = os.environ.get("OUT", "wan_cache/pairs_synth.pt")
+CLIPS = os.environ.get("CLIPS", "wan_cache/synth_clips.pt")
+ADAPTED_BASE = os.environ.get("ADAPTED_BASE")   # merged ckpt -> rollouts from the adapted base
+CORRECTOR = os.environ.get("CORRECTOR")         # LoRA ckpt -> DAgger-round rollouts
 
 
 @torch.no_grad()
@@ -21,8 +24,21 @@ def main():
     torch.set_grad_enabled(False)
     pipe = CausalDiffusionInferencePipeline(cfg, device=torch.device(DEVICE)).to(dtype=torch.bfloat16).cuda()
     pipe.corrector = None
+    if ADAPTED_BASE:
+        _sd = torch.load(ADAPTED_BASE, map_location="cpu")["merged"]
+        pipe.generator.model.load_state_dict({k: v.to(torch.bfloat16) for k, v in _sd.items()}, strict=False)
+        print(f"adapted base loaded: {ADAPTED_BASE}", flush=True)
+    if CORRECTOR:
+        from wan.modules.lora import apply_lora, set_lora_scale, lora_parameters
+        apply_lora(pipe.generator.model, rank=16)
+        _lw = torch.load(CORRECTOR, map_location="cpu")["lora"]
+        _lw = list(_lw.values()) if isinstance(_lw, dict) else _lw
+        for p, w in zip(lora_parameters(pipe.generator.model), _lw):
+            p.data.copy_(w.to(p.device, p.dtype))
+        set_lora_scale(pipe.generator.model, 1.0)
+        print(f"DAgger round with corrector: {CORRECTOR}", flush=True)
 
-    d = torch.load("wan_cache/synth_clips.pt", map_location="cpu")
+    d = torch.load(CLIPS, map_location="cpu")
     gt_all, caps = d["gt"], d["captions"]
     N = gt_all.shape[0]
 
