@@ -20,6 +20,7 @@ BATCH = 4
 D = "wan_cache/finals128"
 TAG = os.environ.get("TAG", "sfc")
 LORA = os.environ.get("LORA", "wan_cache/lora_r_phi_sf.pt")
+N = int(os.environ.get("N", 128))  # subset: N strided prompts
 
 
 @torch.no_grad()
@@ -47,8 +48,9 @@ def main():
     set_lora_scale(model, 1.0)
     print(f"SF-distilled + corrector {LORA} @ scale 1, tag={TAG}", flush=True)
 
-    for b0 in range(0, 128, BATCH):
-        idxs = [i for i in range(b0, min(b0 + BATCH, 128))
+    pids = list(range(0, 128, 128 // N))[:N]
+    for b0 in range(0, len(pids), BATCH):
+        idxs = [i for i in pids[b0:b0 + BATCH]
                 if not os.path.exists(f"{D}/{TAG}_p{i:03d}.mp4")]
         if not idxs:
             continue
@@ -63,7 +65,7 @@ def main():
             tmp = f"{D}/{TAG}_p{i:03d}.mp4.tmp.mp4"
             imageio.mimsave(tmp, fr, fps=16, quality=8)
             os.rename(tmp, f"{D}/{TAG}_p{i:03d}.mp4")
-        print(f"DONE batch {b0 // BATCH + 1}/32", flush=True)
+        print(f"DONE batch {b0 // BATCH + 1}/{(len(pids)+BATCH-1)//BATCH}", flush=True)
     print(f"{TAG} finals complete", flush=True)
 
 
