@@ -60,6 +60,14 @@ def main():
     model.gradient_checkpointing = True
     print(f"v2 LOSS_MODE={LOSS_MODE} | init from {INIT} | pools {POOLS}", flush=True)
     opt = torch.optim.AdamW(lora_parameters(model), lr=LR)
+    START_STEP = 1
+    _pp = os.path.join(OUT, CKPT + ".partial")  # PARTIAL resume after interrupt
+    if os.environ.get("RESUME", "1") == "1" and os.path.exists(_pp):
+        _pd = torch.load(_pp, map_location="cpu")
+        for p, w in zip(lora_parameters(model), _pd["lora"]):
+            p.data.copy_(w.to(p.device, p.dtype))
+        START_STEP = _pd["step"] + 1
+        print(f"resumed from partial step {_pd['step']}", flush=True)
 
     pools = [torch.load(os.path.join(OUT, p), map_location="cpu") for p in POOLS]
     caps = pools[0]["captions"]
@@ -126,7 +134,7 @@ def main():
             s += l_dag.item()
         return s / n
 
-    for step in range(1, STEPS + 1):
+    for step in range(START_STEP, STEPS + 1):
         for pg in opt.param_groups:
             pg["lr"] = LR * min(1.0, step / WARMUP)
         opt.zero_grad()
@@ -135,6 +143,9 @@ def main():
         loss.backward()
         torch.nn.utils.clip_grad_norm_(lora_parameters(model), 1.0)
         opt.step()
+        if step % 200 == 0:
+            torch.save({"lora": [p.detach().cpu() for p in lora_parameters(model)], "step": step},
+                       os.path.join(OUT, CKPT + ".partial"))
         if step % EVAL_EVERY == 0 or step == 1:
             vl = val_loss()
             print(f"step {step:4d} | dag {l_dag.item():.4f} | con {float(l_con):.4f} | val dag-loss {vl:.4f} (R^2 {1-vl:+.3f})", flush=True)

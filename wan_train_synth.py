@@ -52,6 +52,14 @@ def main():
     model.gradient_checkpointing = True   # recompute block activations in backward (else OOM on 18.7k-token seq)
     print(f"LoRA params {num_lora_params(model)/1e6:.2f}M | grad-checkpointing on", flush=True)
     opt = torch.optim.AdamW(lora_parameters(model), lr=LR)
+    START_STEP = 1
+    _pp = os.path.join(OUT, CKPT + ".partial")  # PARTIAL resume after interrupt
+    if os.environ.get("RESUME", "1") == "1" and os.path.exists(_pp):
+        _pd = torch.load(_pp, map_location="cpu")
+        for p, w in zip(lora_parameters(model), _pd["lora"]):
+            p.data.copy_(w.to(p.device, p.dtype))
+        START_STEP = _pd["step"] + 1
+        print(f"resumed from partial step {_pd['step']}", flush=True)
 
     d = torch.load(os.path.join(OUT, PAIRS), map_location="cpu")
     gt, gen, caps = d["gt"], d["gen"], d["captions"]
@@ -92,7 +100,7 @@ def main():
             num += (delta ** 2).sum().item(); den += (rt ** 2).sum().item()
         return 1 - num / (den + 1e-12)
 
-    for step in range(1, STEPS + 1):
+    for step in range(START_STEP, STEPS + 1):
         for pg in opt.param_groups:
             pg["lr"] = LR * min(1.0, step / WARMUP)
         opt.zero_grad(); loss = 0.0; num = den = 0.0
@@ -103,6 +111,9 @@ def main():
         (loss / M_INNER).backward()
         torch.nn.utils.clip_grad_norm_(lora_parameters(model), 1.0)
         opt.step()
+        if step % 200 == 0:
+            torch.save({"lora": [p.detach().cpu() for p in lora_parameters(model)], "step": step},
+                       os.path.join(OUT, CKPT + ".partial"))
         if step % EVAL_EVERY == 0 or step == 1:
             tr = 1 - num / (den + 1e-12)
             print(f"step {step:4d} | loss {(loss/M_INNER).item():.4f} | train R^2 {tr:+.3f} | val R^2 {val_r2():+.3f}", flush=True)
