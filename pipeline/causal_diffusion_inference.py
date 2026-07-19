@@ -334,6 +334,36 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                         flow_weak = hg_uncond + self.args.guidance_scale * (hg_cond - hg_uncond)
                         flow_pred = flow_weak + self.hg_scale * (flow_pred - flow_weak)
 
+                # v3 candidate: frequency-selective correction — full low-freq (drift lives there,
+                # Gate-B), damped high-freq/structure (progression lives there). Needs LoRA applied;
+                # computes correction explicitly via a second pass at scale 0 (2x NFE, experiment only).
+                if getattr(self, "freq_lambda", None) is not None:
+                    from wan.modules.lora import set_lora_scale
+                    set_lora_scale(self.generator.model, 0.0)
+                    base_cond, _ = self.generator(
+                        noisy_image_or_video=latent_model_input, conditional_dict=conditional_dict,
+                        timestep=timestep, kv_cache=self.kv_cache_pos,
+                        crossattn_cache=self.crossattn_cache_pos,
+                        current_start=current_start_frame * self.frame_seq_length,
+                        cache_start=cache_start_frame * self.frame_seq_length)
+                    base_unc, _ = self.generator(
+                        noisy_image_or_video=latent_model_input, conditional_dict=unconditional_dict,
+                        timestep=timestep, kv_cache=self.kv_cache_neg,
+                        crossattn_cache=self.crossattn_cache_neg,
+                        current_start=current_start_frame * self.frame_seq_length,
+                        cache_start=cache_start_frame * self.frame_seq_length)
+                    set_lora_scale(self.generator.model, 1.0)
+                    v_base = base_unc + self.args.guidance_scale * (base_cond - base_unc)
+                    dv = (flow_pred - v_base).float()
+                    F2 = torch.fft.rfft2(dv, dim=(-2, -1))
+                    H, Wd = dv.shape[-2], dv.shape[-1] // 2 + 1
+                    fy = torch.fft.fftfreq(H, device=dv.device).abs().view(-1, 1)
+                    fx = torch.fft.rfftfreq(dv.shape[-1], device=dv.device).view(1, -1)
+                    lowmask = ((fy ** 2 + fx ** 2).sqrt() < self.freq_cutoff).to(F2.dtype)
+                    dv_low = torch.fft.irfft2(F2 * lowmask, s=dv.shape[-2:], dim=(-2, -1))
+                    dv_high = dv - dv_low
+                    flow_pred = (v_base.float() + dv_low + self.freq_lambda * dv_high).to(flow_pred.dtype)
+
                 # idea #6: v_rect = v_theta + alpha(t) * r_phi(z_t, history, t)
                 if self.corrector is not None:
                     history = output[:, max(0, current_start_frame - self.corrector_hist):current_start_frame]
